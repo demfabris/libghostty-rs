@@ -522,7 +522,7 @@ impl<'alloc> Renderer<'alloc> {
         let mut placements = placement_it.update(graphics)?;
         placements.set_layer(layer)?;
 
-        while let Some(placement) = placements.next() {
+        while let Some(placement) = placements.advance() {
             let image_id = placement.image_id()?;
             let Some(image) = graphics.image(image_id) else {
                 continue;

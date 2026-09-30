@@ -118,10 +118,13 @@ pub use crate::{
     error::Error,
     log::{Logger, set_logger},
     render::RenderState,
-    terminal::Terminal,
+    terminal::{ScreenSnapshot, Terminal},
 };
 
 pub(crate) fn sys_set<T>(opt: ffi::SysOption::Type, val: *const T) -> error::Result<()> {
     let result = unsafe { ffi::ghostty_sys_set(opt, val.cast()) };
     error::from_result(result)
 }
+
+#[cfg(test)]
+mod screen_snapshot_tests;

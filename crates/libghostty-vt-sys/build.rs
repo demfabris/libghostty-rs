@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Pinned ghostty commit. Update this to pull a newer version.
-const GHOSTTY_REPO: &str = "https://github.com/ghostty-org/ghostty.git";
-const GHOSTTY_COMMIT: &str = "56dbc4a768778753737a3b9cbe0a3f9b4e434553";
+const GHOSTTY_REPO: &str = "https://github.com/demfabris/ghostty.git";
+const GHOSTTY_COMMIT: &str = "7823f65dd55fc9ff420d5eb5cae761cbd1995994";
 
 // Keep this source repair with the pin until Ghostty delegates Windows DLL
 // startup to the CRT upstream. Source overrides remain caller-owned.
