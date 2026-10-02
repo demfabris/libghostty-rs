@@ -6,8 +6,8 @@ use crate::{
     alloc::{Allocator, Object},
     error::{Error, Result, from_optional_result, from_result},
     ffi,
-    screen::{Cell, Row},
-    style::{RgbColor, Style},
+    screen::{Cell, CellContentTag, CellSemanticContent, CellWide, Row},
+    style::{PaletteIndex, RgbColor, Style},
     terminal::Terminal,
 };
 
@@ -898,6 +898,214 @@ impl CellIteration<'_, '_> {
     pub fn has_styling(&self) -> Result<bool> {
         self.get(ffi::RenderStateRowCellsData::HAS_STYLING)
     }
+
+    /// Copy the columns `[x, x + len)` of this row, clamped to the row
+    /// width, into `out` with one C call.
+    ///
+    /// Styles and multi-codepoint graphemes arrive as indexes into tables
+    /// in `out`, so a renderer resolves each distinct style once per row
+    /// instead of once per cell. The buffers in `out` grow as needed and
+    /// are reused by the next copy. The iteration position is unchanged.
+    pub fn copy_into(&self, x: u16, len: u16, out: &mut CellsCopy) -> Result<()> {
+        out.cells.clear();
+        out.styles.clear();
+        out.graphemes.clear();
+        out.grapheme_bytes.clear();
+        out.cells.reserve(usize::from(len));
+        out.styles.reserve(usize::from(len) + 1);
+        for _ in 0..4 {
+            let mut raw = ffi::sized!(ffi::RenderStateRowCellsCopy);
+            raw.cells = out.cells.as_mut_ptr().cast();
+            raw.cells_cap = out.cells.capacity();
+            raw.styles = out.styles.as_mut_ptr();
+            raw.styles_cap = out.styles.capacity();
+            raw.graphemes = out.graphemes.as_mut_ptr();
+            raw.graphemes_cap = out.graphemes.capacity();
+            raw.grapheme_bytes = out.grapheme_bytes.as_mut_ptr();
+            raw.grapheme_bytes_cap = out.grapheme_bytes.capacity();
+            let result = unsafe {
+                ffi::ghostty_render_state_row_cells_copy(self.iter.0.as_raw(), x, len, &raw mut raw)
+            };
+            match result {
+                ffi::Result::SUCCESS => {
+                    if raw.cells_len > out.cells.capacity()
+                        || raw.styles_len > out.styles.capacity()
+                        || raw.graphemes_len > out.graphemes.capacity()
+                        || raw.grapheme_bytes_len > out.grapheme_bytes.capacity()
+                    {
+                        return Err(Error::InvalidValue);
+                    }
+                    // SAFETY: On success the C API initialized the first
+                    // `*_len` entries of each buffer, all within capacity.
+                    unsafe {
+                        out.cells.set_len(raw.cells_len);
+                        out.styles.set_len(raw.styles_len);
+                        out.graphemes.set_len(raw.graphemes_len);
+                        out.grapheme_bytes.set_len(raw.grapheme_bytes_len);
+                    }
+                    return Ok(());
+                }
+                ffi::Result::OUT_OF_SPACE => {
+                    out.cells.reserve(raw.cells_len);
+                    out.styles.reserve(raw.styles_len);
+                    out.graphemes.reserve(raw.graphemes_len);
+                    out.grapheme_bytes.reserve(raw.grapheme_bytes_len);
+                }
+                code => return from_result(code),
+            }
+        }
+        Err(Error::OutOfSpace { required: 0 })
+    }
+}
+
+/// Packed cells copied from one render-state row by
+/// [`CellIteration::copy_into`], with the row's styles and multi-codepoint
+/// graphemes in tables the cells index.
+#[derive(Default)]
+pub struct CellsCopy {
+    cells: Vec<CopiedCell>,
+    styles: Vec<ffi::Style>,
+    graphemes: Vec<ffi::RenderStateGrapheme>,
+    grapheme_bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for CellsCopy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CellsCopy")
+            .field("cells", &self.cells)
+            .field("styles", &self.styles.len())
+            .field("graphemes", &self.graphemes)
+            .field("grapheme_bytes", &self.grapheme_bytes)
+            .finish()
+    }
+}
+
+impl CellsCopy {
+    /// Create an empty copy buffer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The copied cells, one per column.
+    #[must_use]
+    pub fn cells(&self) -> &[CopiedCell] {
+        &self.cells
+    }
+
+    /// The number of entries in the style table. Index 0 is the default
+    /// style.
+    #[must_use]
+    pub fn style_count(&self) -> usize {
+        self.styles.len()
+    }
+
+    /// The style table entry a cell's [`CopiedCell::style_index`] names.
+    pub fn style(&self, index: usize) -> Result<Style> {
+        let raw = self.styles.get(index).ok_or(Error::InvalidValue)?;
+        Style::try_from(*raw)
+    }
+
+    /// The UTF-8 grapheme cluster of a cell with more than one codepoint,
+    /// base codepoint first, or `None` for a cell with at most one.
+    pub fn grapheme(&self, cell: CopiedCell) -> Result<Option<&str>> {
+        let Some(index) = usize::from(cell.0.grapheme).checked_sub(1) else {
+            return Ok(None);
+        };
+        let span = self.graphemes.get(index).ok_or(Error::InvalidValue)?;
+        let start = usize::try_from(span.offset).map_err(|_| Error::InvalidValue)?;
+        let len = usize::try_from(span.len).map_err(|_| Error::InvalidValue)?;
+        let bytes = start
+            .checked_add(len)
+            .and_then(|end| self.grapheme_bytes.get(start..end))
+            .ok_or(Error::InvalidValue)?;
+        std::str::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| Error::InvalidValue)
+    }
+}
+
+/// One cell of a [`CellsCopy`].
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug)]
+pub struct CopiedCell(ffi::RenderStateCell);
+
+impl CopiedCell {
+    /// What kind of content the cell holds.
+    pub fn content_tag(self) -> Result<CellContentTag> {
+        CellContentTag::try_from(i32::from(self.0.content_tag)).map_err(|_| Error::InvalidValue)
+    }
+
+    /// The base codepoint of a cell with text, or `None` for a cell
+    /// without text.
+    #[must_use]
+    pub fn codepoint(self) -> Option<char> {
+        let tag = i32::from(self.0.content_tag);
+        let text =
+            tag == ffi::CellContentTag::CODEPOINT || tag == ffi::CellContentTag::CODEPOINT_GRAPHEME;
+        if text && self.0.content != 0 {
+            char::from_u32(self.0.content)
+        } else {
+            None
+        }
+    }
+
+    /// The background palette index of a cell whose content tag is
+    /// [`CellContentTag::BgColorPalette`].
+    #[must_use]
+    pub fn bg_color_palette(self) -> Option<PaletteIndex> {
+        let [_, _, _, index] = self.0.content.to_be_bytes();
+        (i32::from(self.0.content_tag) == ffi::CellContentTag::BG_COLOR_PALETTE)
+            .then_some(PaletteIndex(index))
+    }
+
+    /// The background color of a cell whose content tag is
+    /// [`CellContentTag::BgColorRgb`].
+    #[must_use]
+    pub fn bg_color_rgb(self) -> Option<RgbColor> {
+        let [_, r, g, b] = self.0.content.to_be_bytes();
+        (i32::from(self.0.content_tag) == ffi::CellContentTag::BG_COLOR_RGB).then_some(RgbColor {
+            r,
+            g,
+            b,
+        })
+    }
+
+    /// The width of the cell.
+    pub fn wide(self) -> Result<CellWide> {
+        CellWide::try_from(i32::from(self.0.wide)).map_err(|_| Error::InvalidValue)
+    }
+
+    /// Whether the cell has a hyperlink.
+    #[must_use]
+    pub fn has_hyperlink(self) -> bool {
+        u32::from(self.0.flags) & ffi::RENDER_STATE_CELL_HYPERLINK != 0
+    }
+
+    /// Whether the cell is protected.
+    #[must_use]
+    pub fn is_protected(self) -> bool {
+        u32::from(self.0.flags) & ffi::RENDER_STATE_CELL_PROTECTED != 0
+    }
+
+    /// The semantic content of the cell.
+    pub fn semantic_content(self) -> Result<CellSemanticContent> {
+        CellSemanticContent::try_from(i32::from(self.0.semantic_content))
+            .map_err(|_| Error::InvalidValue)
+    }
+
+    /// The cell's index into [`CellsCopy::style`]; 0 is the default style.
+    #[must_use]
+    pub fn style_index(self) -> usize {
+        usize::from(self.0.style)
+    }
+
+    /// Whether the cell's text is a multi-codepoint grapheme cluster read
+    /// through [`CellsCopy::grapheme`].
+    #[must_use]
+    pub fn has_grapheme(self) -> bool {
+        self.0.grapheme != 0
+    }
 }
 
 //---------------------------
@@ -965,6 +1173,69 @@ mod tests {
     /// type `*const &T` (a pointer to the local reference), not `*const T`.
     /// C reads stack-address bytes into the dirty field, the next `update`
     /// propagates them, and `dirty()` fails enum decoding.
+    #[test]
+    fn copy_into_matches_the_per_cell_getters() {
+        let mut terminal = Terminal::new(12, 4).unwrap();
+        terminal.vt_write(
+            "\x1b[1;31mab\x1b[0mc\x1b[1;31md\x1b[0me\u{301}\u{4E2D}\x1b]8;;http://x\x1b\\L\x1b]8;;\x1b\\\x1b[4;38;2;1;2;3mu\x1b[0m\r\n\x1b[48;5;4m\x1b[K\x1b[0m\r\n\x1b[48;2;7;8;9m\x1b[K\x1b[0mz"
+                .as_bytes(),
+        );
+        let mut state = RenderState::new().unwrap();
+        let snapshot = state.update(&terminal).unwrap();
+        let mut rows = RowIterator::new().unwrap();
+        let mut cells = CellIterator::new().unwrap();
+        let mut copy = CellsCopy::new();
+        let mut rows = rows.update(&snapshot).unwrap();
+        let mut text = String::new();
+        let mut row_count = 0;
+        while let Some(row) = rows.next() {
+            let mut iteration = cells.update(row).unwrap();
+            iteration.copy_into(0, u16::MAX, &mut copy).unwrap();
+            assert_eq!(copy.cells().len(), 12);
+            if row_count == 0 {
+                assert_eq!(copy.style_count(), 3);
+                assert!(copy.cells()[7].has_hyperlink());
+                assert_eq!(copy.grapheme(copy.cells()[4]).unwrap(), Some("e\u{301}"));
+            }
+            for (x, copied) in copy.cells().iter().copied().enumerate() {
+                iteration.select(u16::try_from(x).unwrap()).unwrap();
+                let raw = iteration.raw_cell().unwrap();
+                assert_eq!(copied.content_tag().unwrap(), raw.content_tag().unwrap());
+                assert_eq!(copied.wide().unwrap(), raw.wide().unwrap());
+                assert_eq!(copied.has_hyperlink(), raw.has_hyperlink().unwrap());
+                assert_eq!(
+                    copied.semantic_content().unwrap(),
+                    raw.semantic_content().unwrap()
+                );
+                assert_eq!(
+                    copy.style(copied.style_index()).unwrap(),
+                    iteration.style().unwrap()
+                );
+                text.clear();
+                iteration.graphemes_utf8(&mut text).unwrap();
+                let copied_text = match copy.grapheme(copied).unwrap() {
+                    Some(cluster) => cluster.to_owned(),
+                    None => copied.codepoint().map(String::from).unwrap_or_default(),
+                };
+                assert_eq!(copied_text, text);
+                match raw.content_tag().unwrap() {
+                    CellContentTag::BgColorPalette => {
+                        assert_eq!(
+                            copied.bg_color_palette(),
+                            Some(raw.bg_color_palette().unwrap())
+                        );
+                    }
+                    CellContentTag::BgColorRgb => {
+                        assert_eq!(copied.bg_color_rgb(), Some(raw.bg_color_rgb().unwrap()));
+                    }
+                    _ => assert_eq!(copied.bg_color_palette(), None),
+                }
+            }
+            row_count += 1;
+        }
+        assert_eq!(row_count, 4);
+    }
+
     #[test]
     fn dirty_decodes_after_set_dirty_then_update() {
         let terminal = Terminal::new(8, 3).unwrap();

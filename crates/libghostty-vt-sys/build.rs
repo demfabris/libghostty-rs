@@ -4,7 +4,7 @@ use std::process::Command;
 
 /// Pinned ghostty commit. Update this to pull a newer version.
 const GHOSTTY_REPO: &str = "https://github.com/demfabris/ghostty.git";
-const GHOSTTY_COMMIT: &str = "7823f65dd55fc9ff420d5eb5cae761cbd1995994";
+const GHOSTTY_COMMIT: &str = "189df4a1f6403f5bdc349fe44d1d2809741a4c1d";
 
 // Keep this source repair with the pin until Ghostty delegates Windows DLL
 // startup to the CRT upstream. Source overrides remain caller-owned.
