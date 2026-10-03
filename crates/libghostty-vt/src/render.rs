@@ -537,10 +537,10 @@ impl<'alloc> RowIterator<'alloc> {
 
     /// Update the row iterator for a snapshot of the render state,
     /// returning a new row iteration.
-    pub fn update(
-        &mut self,
-        snapshot: &'_ Snapshot<'alloc, '_>,
-    ) -> Result<RowIteration<'alloc, '_>> {
+    pub fn update<'s>(
+        &'s mut self,
+        snapshot: &'s Snapshot<'alloc, '_>,
+    ) -> Result<RowIteration<'alloc, 's>> {
         let result = unsafe {
             ffi::ghostty_render_state_get(
                 snapshot.0.0.as_raw(),
@@ -658,10 +658,10 @@ impl<'alloc> CellIterator<'alloc> {
 
     /// Update the cell iterator for a new row iteration,
     /// returning a new cell iteration.
-    pub fn update(
-        &mut self,
-        row: &'_ RowIteration<'alloc, '_>,
-    ) -> Result<CellIteration<'alloc, '_>> {
+    pub fn update<'s>(
+        &'s mut self,
+        row: &'s RowIteration<'alloc, '_>,
+    ) -> Result<CellIteration<'alloc, 's>> {
         let result = unsafe {
             ffi::ghostty_render_state_row_get(
                 row.iter.0.as_raw(),
