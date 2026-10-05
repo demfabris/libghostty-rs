@@ -363,6 +363,29 @@ impl<'alloc> RenderState<'alloc> {
         from_result(result)?;
         Ok(Update { state: Some(self) })
     }
+
+    /// Capture only part of the viewport from the next update on.
+    ///
+    /// Rows and columns outside the clip are not copied, so an update of a
+    /// very large viewport costs what the clip holds. Rows, cells, and the
+    /// cursor keep viewport coordinates; read [`Snapshot::clip`] for what
+    /// an update captured. The default [`Clip`] captures the whole viewport.
+    /// Expect a full redraw on the update after a change.
+    pub fn set_clip(&mut self, clip: Clip) -> Result<()> {
+        let raw = ffi::RenderStateClip {
+            y: clip.y,
+            rows: clip.rows,
+            cols: clip.cols,
+        };
+        let result = unsafe {
+            ffi::ghostty_render_state_set(
+                self.0.as_raw(),
+                ffi::RenderStateOption::CLIP,
+                std::ptr::from_ref(&raw).cast(),
+            )
+        };
+        from_result(result)
+    }
 }
 
 impl Drop for RenderState<'_> {
@@ -429,6 +452,18 @@ impl Snapshot<'_, '_> {
     /// Get the viewport height.
     pub fn rows(&self) -> Result<u16> {
         self.get(ffi::RenderStateData::ROWS)
+    }
+
+    /// The part of the viewport this snapshot captured: the
+    /// [`RenderState::set_clip`] request limited to the viewport, with zero
+    /// counts replaced by the rows and columns they stand for.
+    pub fn clip(&self) -> Result<Clip> {
+        let raw: ffi::RenderStateClip = self.get(ffi::RenderStateData::CLIP)?;
+        Ok(Clip {
+            y: raw.y,
+            rows: raw.rows,
+            cols: raw.cols,
+        })
     }
 
     /// Get the cursor color that may have been explicitly set by the terminal state.
@@ -907,6 +942,22 @@ impl CellIteration<'_, '_> {
     /// instead of once per cell. The buffers in `out` grow as needed and
     /// are reused by the next copy. The iteration position is unchanged.
     pub fn copy_into(&self, x: u16, len: u16, out: &mut CellsCopy) -> Result<()> {
+        self.copy_with_flags(x, len, 0, out)
+    }
+
+    /// Like [`Self::copy_into`], but stop after the last cell of the range
+    /// that is not a default cell.
+    ///
+    /// A default cell is an erased or never written column: no text, the
+    /// default style, narrow, without hyperlink or protection, and output
+    /// semantic content. [`CellsCopy::cells`] can then hold fewer cells
+    /// than the range, and every column after them is a default cell the
+    /// caller fills in itself.
+    pub fn copy_trimmed_into(&self, x: u16, len: u16, out: &mut CellsCopy) -> Result<()> {
+        self.copy_with_flags(x, len, ffi::RENDER_STATE_ROW_CELLS_COPY_TRIM, out)
+    }
+
+    fn copy_with_flags(&self, x: u16, len: u16, flags: u32, out: &mut CellsCopy) -> Result<()> {
         out.cells.clear();
         out.styles.clear();
         out.graphemes.clear();
@@ -923,6 +974,7 @@ impl CellIteration<'_, '_> {
             raw.graphemes_cap = out.graphemes.capacity();
             raw.grapheme_bytes = out.grapheme_bytes.as_mut_ptr();
             raw.grapheme_bytes_cap = out.grapheme_bytes.capacity();
+            raw.flags = flags;
             let result = unsafe {
                 ffi::ghostty_render_state_row_cells_copy(self.iter.0.as_raw(), x, len, &raw mut raw)
             };
@@ -1112,6 +1164,22 @@ impl CopiedCell {
 // Auxiliary types
 //---------------------------
 
+/// A part of the viewport: a range of rows and the leftmost columns of each.
+///
+/// Requested with [`RenderState::set_clip`] and reported by
+/// [`Snapshot::clip`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Clip {
+    /// The first viewport row.
+    pub y: u16,
+    /// The number of rows starting at `y`. In a request, zero means every
+    /// row from `y` to the bottom of the viewport.
+    pub rows: u16,
+    /// The number of columns from the left edge. In a request, zero means
+    /// every column.
+    pub cols: u16,
+}
+
 /// Cursor viewport position information.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CursorViewport {
@@ -1234,6 +1302,90 @@ mod tests {
             row_count += 1;
         }
         assert_eq!(row_count, 4);
+    }
+
+    #[test]
+    fn copy_trimmed_into_stops_at_the_last_written_cell() {
+        let mut terminal = Terminal::new(20, 3).unwrap();
+        terminal.vt_write("ab\x1b[5Gc\r\n\x1b[48;5;4m\x1b[K\x1b[0m".as_bytes());
+        let mut state = RenderState::new().unwrap();
+        let snapshot = state.update(&terminal).unwrap();
+        let mut rows = RowIterator::new().unwrap();
+        let mut cells = CellIterator::new().unwrap();
+        let mut full = CellsCopy::new();
+        let mut trimmed = CellsCopy::new();
+        let mut rows = rows.update(&snapshot).unwrap();
+        let mut lengths = Vec::new();
+        while let Some(row) = rows.next() {
+            let iteration = cells.update(row).unwrap();
+            iteration.copy_into(0, 20, &mut full).unwrap();
+            iteration.copy_trimmed_into(0, 20, &mut trimmed).unwrap();
+            let used = trimmed.cells().len();
+            let fields = |cell: &CopiedCell| {
+                let raw = cell.0;
+                (
+                    raw.content,
+                    raw.style,
+                    raw.grapheme,
+                    raw.content_tag,
+                    raw.wide,
+                    raw.flags,
+                    raw.semantic_content,
+                )
+            };
+            for (a, b) in full.cells()[..used].iter().zip(trimmed.cells()) {
+                assert_eq!(fields(a), fields(b));
+            }
+            for cell in &full.cells()[used..] {
+                assert_eq!(cell.codepoint(), None);
+                assert_eq!(cell.style_index(), 0);
+                assert_eq!(cell.content_tag().unwrap(), CellContentTag::Codepoint);
+                assert!(!cell.has_hyperlink());
+            }
+            lengths.push(used);
+        }
+        assert_eq!(lengths, [5, 20, 0]);
+    }
+
+    #[test]
+    fn clip_limits_the_captured_rows_and_columns() {
+        let mut terminal = Terminal::new(10, 6).unwrap();
+        terminal.vt_write(b"r0\r\nr1\r\nr2\r\nr3\r\nr4\r\nr5");
+        let mut state = RenderState::new().unwrap();
+        assert_eq!(
+            state.update(&terminal).unwrap().clip().unwrap(),
+            Clip {
+                y: 0,
+                rows: 6,
+                cols: 10
+            }
+        );
+        let clip = Clip {
+            y: 2,
+            rows: 3,
+            cols: 4,
+        };
+        state.set_clip(clip).unwrap();
+        let snapshot = state.update(&terminal).unwrap();
+        assert_eq!(snapshot.clip().unwrap(), clip);
+        assert_eq!(snapshot.rows().unwrap(), 6);
+        assert_eq!(snapshot.cols().unwrap(), 10);
+        assert_eq!(snapshot.cursor_viewport().unwrap(), None);
+        let mut rows = RowIterator::new().unwrap();
+        let mut cells = CellIterator::new().unwrap();
+        let mut copy = CellsCopy::new();
+        let mut rows = rows.update(&snapshot).unwrap();
+        let mut seen = Vec::new();
+        while let Some(row) = rows.next() {
+            cells
+                .update(row)
+                .unwrap()
+                .copy_into(0, 10, &mut copy)
+                .unwrap();
+            assert_eq!(copy.cells().len(), 4);
+            seen.push(copy.cells()[1].codepoint().unwrap());
+        }
+        assert_eq!(seen, ['2', '3', '4']);
     }
 
     #[test]
